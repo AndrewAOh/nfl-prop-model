@@ -1,0 +1,7 @@
+pandas>=2.2,<3
+pyarrow>=16,<22
+duckdb>=1.0,<2
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+pydantic>=2.7,<3
+pytest>=8,<9
