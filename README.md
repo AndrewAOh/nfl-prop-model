@@ -1,29 +1,48 @@
-# NFL Player Prop Model
+# NFL Player Prop Model — Free Local MVP
 
-Free-first, point-in-time NFL player prop modeling system using Python, Parquet, and DuckDB.
+This is a Python-first scaffold for a reproducible NFL player prop projection system.
+The initial focus is receiving yards and receptions, with modular ingestion, feature,
+modeling, simulation, pricing, and evaluation components.
 
-## Principles
-- Raw downloads are immutable and never committed to Git.
-- Every source is isolated behind an adapter.
-- Source failures are logged and do not automatically stop unrelated ingestion.
-- Features must have an availability timestamp and be usable before kickoff.
-- Proprietary or restricted sources are optional; the MVP can run without API keys.
+## Setup
 
-## Setup (macOS)
 ```bash
-python3 --version
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-cp .env.example .env
-python scripts/init_project.py
-python scripts/healthcheck.py
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+pip install -e ".[dev]"
 ```
 
-## Run free-source foundation
+## Run the demo
+
 ```bash
-python scripts/ingest_foundation.py --season 2025
+python scripts/demo_projection.py
 ```
 
-The initial implementation downloads nflverse data and records optional-source skips. Advanced sources are deliberately disabled unless a public endpoint/format is configured and validated.
+## Download public nflverse data
+
+```bash
+python scripts/download_nflverse.py --season 2024 --dataset player_stats
+python scripts/download_nflverse.py --season 2024 --dataset schedules
+python scripts/download_nflverse.py --season 2024 --dataset pbp
+```
+
+## Run tests
+
+```bash
+pytest
+```
+
+## Current status
+
+This is an initial implementation scaffold, not a production-ready betting model.
+The simple opportunity and efficiency models are placeholders. Before using the
+outputs for decisions, add point-in-time feature snapshots, robust player/team ID
+mapping, game-state models, target allocation across teammates, defensive matchup
+features, uncertainty scenarios, and chronological backtesting.
+
+## Data notes
+
+- nflverse is used as the main free historical data source.
+- Open-Meteo is provided as a weather integration example.
+- Odds API integration is optional and requires a configured key if used.
+- Manual odds CSV ingestion is supported so the model can operate without a paid odds API.
