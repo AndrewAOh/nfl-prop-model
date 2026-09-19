@@ -1,10 +1,16 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import logging
+import time
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -55,125 +61,301 @@ STADIUMS: dict[str, Stadium] = {
 
 
 class OpenMeteoClient:
-    """
-    Retrieves hourly historical weather from Open-Meteo.
-
-    Historical games should use the archive endpoint.
-    """
-
     BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+    def __init__(
+        self,
+        timeout: tuple[int, int] = (5, 30),
+        max_retries: int = 3,
+    ):
+        self.timeout = timeout
+
+        self.session = requests.Session()
+
+        retry_strategy = Retry(
+            total=max_retries,
+            connect=max_retries,
+            read=max_retries,
+            status=max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10,
+        )
+
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def close(self) -> None:
+        """Close the underlying HTTP session."""
+        self.session.close()
 
     def get_game_weather(
         self,
         team: str,
         kickoff_at: datetime,
-    ) -> Optional[dict]:
+    ) -> Dict[str, Any]:
+        """
+        Retrieve hourly weather data for a game.
+
+        The API returns timestamps in UTC. The game kickoff is converted
+        to UTC before determining the requested date.
+        """
+
         stadium = STADIUMS.get(team)
 
         if stadium is None:
-            raise ValueError(f"No stadium metadata found for team: {team}")
+            return {
+                "weather_available": False,
+                "reason": f"Unknown stadium for team: {team}",
+            }
 
-        # Indoor stadiums do not expose meaningful outdoor game conditions.
         if stadium.roof_type == "dome":
             return {
-                "stadium": stadium.name,
-                "roof_type": stadium.roof_type,
-                "weather_available": False,
-                "reason": "Indoor dome",
-            }
-        elif stadium.roof_type == "retractable":
-            return {
-                "stadium": stadium.name,
-                "roof_type": stadium.roof_type,
                 "weather_available": False,
                 "reason": "Indoor dome",
             }
 
-        date_string = kickoff_at.date().isoformat()
+        if stadium.roof_type == "retractable":
+            return {
+                "weather_available": False,
+                "reason": "Retractable roof; roof state unavailable",
+            }
+
+        # Ensure kickoff is timezone-aware.
+        if kickoff_at.tzinfo is None:
+            raise ValueError(
+                "kickoff_at must be timezone-aware"
+            )
+
+        # Convert local kickoff time to UTC.
+        kickoff_utc = kickoff_at.astimezone(timezone.utc)
+
+        # Use the UTC date because the API response is in UTC.
+        date_string = kickoff_utc.date().isoformat()
 
         params = {
             "latitude": stadium.latitude,
             "longitude": stadium.longitude,
             "start_date": date_string,
             "end_date": date_string,
-            "hourly": [
-                "temperature_2m",
-                "relative_humidity_2m",
-                "precipitation",
-                "rain",
-                "snowfall",
-                "wind_speed_10m",
-                "wind_gusts_10m",
-                "wind_direction_10m",
-                "weather_code",
-            ],
+            "hourly": ",".join(
+                [
+                    "temperature_2m",
+                    "relative_humidity_2m",
+                    "precipitation",
+                    "rain",
+                    "snowfall",
+                    "wind_speed_10m",
+                    "wind_gusts_10m",
+                    "wind_direction_10m",
+                    "weather_code",
+                ]
+            ),
             "timezone": "UTC",
         }
 
-        response = requests.get(
-            self.BASE_URL,
-            params=params,
-            timeout=30,
-        )
-        response.raise_for_status()
+        start_time = time.monotonic()
 
-        weather = response.json()
+        try:
+            response = self.session.get(
+                self.BASE_URL,
+                params=params,
+                timeout=self.timeout,
+            )
 
-        return {
-            "stadium": stadium.name,
-            "latitude": stadium.latitude,
-            "longitude": stadium.longitude,
-            "roof_type": stadium.roof_type,
-            "weather_available": True,
-            "kickoff_at": kickoff_at.isoformat(),
-            "hourly_weather": weather.get("hourly", {}),
-        }
+            elapsed = time.monotonic() - start_time
+
+            logger.debug(
+                "Open-Meteo request completed: team=%s date=%s "
+                "status=%s duration=%.2fs",
+                team,
+                date_string,
+                response.status_code,
+                elapsed,
+            )
+
+            response.raise_for_status()
+
+            weather_data = response.json()
+
+            return {
+                "weather_available": True,
+                "team": team,
+                "stadium": stadium.name,
+                "latitude": stadium.latitude,
+                "longitude": stadium.longitude,
+                "roof_type": stadium.roof_type,
+                "requested_date": date_string,
+                "hourly": weather_data.get("hourly", {}),
+            }
+
+        except requests.exceptions.Timeout as exc:
+            elapsed = time.monotonic() - start_time
+
+            logger.warning(
+                "Open-Meteo timeout: team=%s date=%s "
+                "duration=%.2fs error=%s",
+                team,
+                date_string,
+                elapsed,
+                exc,
+            )
+
+            return {
+                "weather_available": False,
+                "reason": "Request timeout",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+
+        except requests.exceptions.HTTPError as exc:
+            elapsed = time.monotonic() - start_time
+
+            status_code = (
+                exc.response.status_code
+                if exc.response is not None
+                else None
+            )
+
+            logger.warning(
+                "Open-Meteo HTTP error: team=%s date=%s "
+                "status=%s duration=%.2fs error=%s",
+                team,
+                date_string,
+                status_code,
+                elapsed,
+                exc,
+            )
+
+            return {
+                "weather_available": False,
+                "reason": "HTTP error",
+                "status_code": status_code,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+
+        except requests.exceptions.RequestException as exc:
+            elapsed = time.monotonic() - start_time
+
+            logger.warning(
+                "Open-Meteo request failed: team=%s date=%s "
+                "duration=%.2fs error=%s",
+                team,
+                date_string,
+                elapsed,
+                exc,
+            )
+
+            return {
+                "weather_available": False,
+                "reason": "Request error",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+
+        except ValueError as exc:
+            logger.warning(
+                "Invalid JSON from Open-Meteo: team=%s date=%s error=%s",
+                team,
+                date_string,
+                exc,
+            )
+
+            return {
+                "weather_available": False,
+                "reason": "Invalid API response",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
 
 def select_kickoff_weather(
-    hourly_weather: dict,
+    hourly_weather: Dict[str, Any],
     kickoff_at: datetime,
-) -> dict:
+) -> Optional[Dict[str, Any]]:
+    """
+    Select the weather observation closest to kickoff.
+
+    Open-Meteo timestamps are returned as naive UTC timestamps.
+    """
+
+    if not hourly_weather:
+        return None
+
     timestamps = hourly_weather.get("time", [])
 
     if not timestamps:
-        return {}
+        logger.warning("Weather response contained no timestamps")
+        return None
 
-    kickoff_timestamp = kickoff_at.replace(
-        minute=0,
-        second=0,
-        microsecond=0,
-    ).isoformat()
-
-    # Open-Meteo may format timestamps without timezone information.
-    kickoff_timestamp = kickoff_timestamp.replace("+00:00", "")
-
-    try:
-        index = timestamps.index(kickoff_timestamp)
-    except ValueError:
-        # Fallback to the closest available hour.
-        parsed_times = [
-            datetime.fromisoformat(timestamp)
-            for timestamp in timestamps
-        ]
-
-        index = min(
-            range(len(parsed_times)),
-            key=lambda i: abs(parsed_times[i] - kickoff_at.replace(tzinfo=None)),
+    if kickoff_at.tzinfo is None:
+        raise ValueError(
+            "kickoff_at must be timezone-aware"
         )
 
-    result = {}
+    # Convert kickoff to UTC and remove timezone information so it can
+    # be compared to the API's naive UTC timestamps.
+    kickoff_utc_naive = (
+        kickoff_at
+        .astimezone(timezone.utc)
+        .replace(tzinfo=None)
+    )
 
-    for field, values in hourly_weather.items():
-        if field == "time":
+    parsed_timestamps = []
+
+    for timestamp in timestamps:
+        try:
+            parsed_timestamps.append(
+                datetime.fromisoformat(timestamp)
+            )
+        except ValueError:
+            parsed_timestamps.append(None)
+
+    valid_timestamps = [
+        timestamp
+        for timestamp in parsed_timestamps
+        if timestamp is not None
+    ]
+
+    if not valid_timestamps:
+        logger.warning("Could not parse weather timestamps")
+        return None
+
+    # Select the closest hourly observation.
+    selected_timestamp = min(
+        valid_timestamps,
+        key=lambda timestamp: abs(
+            timestamp - kickoff_utc_naive
+        ),
+    )
+
+    selected_index = parsed_timestamps.index(
+        selected_timestamp
+    )
+
+    selected_weather = {
+        "timestamp": timestamps[selected_index],
+    }
+
+    # Extract the corresponding value from every weather variable.
+    for variable, values in hourly_weather.items():
+        if variable == "time":
             continue
 
-        if index < len(values):
-            result[field] = values[index]
+        if selected_index < len(values):
+            selected_weather[variable] = values[selected_index]
+        else:
+            selected_weather[variable] = None
 
-    return result
-
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+    return selected_weather
 
 from nfl_props.ingestion.weather import (
     OpenMeteoClient,
@@ -182,58 +364,99 @@ from nfl_props.ingestion.weather import (
 
 
 def get_weather_for_game(
-    game: dict,
-    client: OpenMeteoClient | None = None,
-) -> dict:
+    home_team: str,
+    gameday: str,
+    gametime: str,
+    client: Optional[OpenMeteoClient] = None,
+) -> Dict[str, Any]:
+    """
+    Retrieve and select weather for a specific NFL game.
+    """
+
+    from zoneinfo import ZoneInfo
+
+    should_close_client = client is None
+
     if client is None:
         client = OpenMeteoClient()
 
-    gameday = game["gameday"]
-    gametime = game["gametime"]
+    try:
+        # Adjust the format if your schedule uses a different time format.
+        kickoff_naive = datetime.strptime(
+            f"{gameday} {gametime}",
+            "%Y-%m-%d %H:%M",
+        )
 
-    if isinstance(gameday, datetime):
-        game_date = gameday.date()
-    else:
-        game_date = datetime.fromisoformat(
-            str(gameday)
-        ).date()
+        kickoff_at = kickoff_naive.replace(
+            tzinfo=ZoneInfo("America/New_York")
+        )
 
-    kickoff_at = datetime.strptime(
-        f"{game_date} {gametime}",
-        "%Y-%m-%d %H:%M",
-    ).replace(
-        tzinfo=ZoneInfo("America/New_York")
-    )
+        weather_response = client.get_game_weather(
+            team=home_team,
+            kickoff_at=kickoff_at,
+        )
 
-    weather_result = client.get_game_weather(
-        team=game["home_team"],
-        kickoff_at=kickoff_at,
-    )
+        if not weather_response.get("weather_available", False):
+            return {
+                "weather_available": False,
+                "reason": weather_response.get(
+                    "reason",
+                    "Weather unavailable",
+                ),
+                "error_type": weather_response.get("error_type"),
+                "error_message": weather_response.get(
+                    "error_message"
+                ),
+            }
 
-    if not weather_result:
+        hourly_weather = weather_response.get("hourly", {})
+
+        selected_weather = select_kickoff_weather(
+            hourly_weather=hourly_weather,
+            kickoff_at=kickoff_at,
+        )
+
+        if selected_weather is None:
+            return {
+                "weather_available": False,
+                "reason": "Could not select kickoff weather",
+            }
+
         return {
-            "game_id": game["game_id"],
+            "weather_available": True,
+            "weather_timestamp": selected_weather.get("timestamp"),
+            "temperature_2m": selected_weather.get("temperature_2m"),
+            "relative_humidity_2m": selected_weather.get(
+                "relative_humidity_2m"
+            ),
+            "precipitation": selected_weather.get("precipitation"),
+            "rain": selected_weather.get("rain"),
+            "snowfall": selected_weather.get("snowfall"),
+            "wind_speed_10m": selected_weather.get("wind_speed_10m"),
+            "wind_gusts_10m": selected_weather.get("wind_gusts_10m"),
+            "wind_direction_10m": selected_weather.get(
+                "wind_direction_10m"
+            ),
+            "weather_code": selected_weather.get("weather_code"),
+        }
+
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "Could not parse kickoff time: team=%s "
+            "gameday=%s gametime=%s error=%s",
+            home_team,
+            gameday,
+            gametime,
+            exc,
+        )
+
+        return {
             "weather_available": False,
+            "reason": "Invalid kickoff datetime",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
         }
 
-    if not weather_result["weather_available"]:
-        return {
-            "game_id": game["game_id"],
-            **weather_result,
-        }
-
-    kickoff_weather = select_kickoff_weather(
-        weather_result["hourly_weather"],
-        kickoff_at,
-    )
-
-    return {
-        "game_id": game["game_id"],
-        "season": game.get("season"),
-        "week": game.get("week"),
-        "home_team": game["home_team"],
-        "away_team": game["away_team"],
-        "kickoff_at": kickoff_at,
-        "weather_available": True,
-        **kickoff_weather,
-    }
+    finally:
+        if should_close_client:
+            client.close()

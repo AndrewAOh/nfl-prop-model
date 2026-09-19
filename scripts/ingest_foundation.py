@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 import pandas as pd
 import logging
+import time
+from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from nfl_props.config.settings import settings
@@ -13,6 +15,13 @@ from nfl_props.storage.duckdb_store import DuckDBStore
 from nfl_props.ingestion.weather import OpenMeteoClient, get_weather_for_game
 
 logger = logging.getLogger(__name__)
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format=(
+#         "%(asctime)s | %(levelname)s | "
+#         "%(name)s | %(message)s"
+#     ),
+# )
 
 
 def ingest_game_weather(
@@ -20,78 +29,118 @@ def ingest_game_weather(
     output_dir: Path,
 ) -> pd.DataFrame:
     """
-    Retrieve weather for every scheduled game and save as Parquet.
+    Ingest historical weather for scheduled games.
+
+    Failures are recorded as rows instead of stopping the entire run.
     """
 
-    required_columns = {
+    required_columns = [
         "game_id",
-        "season",
-        "week",
         "gameday",
-        "home_team",
-        "away_team",
         "gametime",
-    }
+        "home_team",
+    ]
 
-    missing_columns = required_columns - set(schedules.columns)
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in schedules.columns
+    ]
 
     if missing_columns:
         raise ValueError(
             f"Schedules missing required columns: {missing_columns}"
         )
 
-    if schedules.empty:
-        logger.warning("No scheduled games found.")
-        return pd.DataFrame()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    weather_records = []
-    client = OpenMeteoClient()
+    weather_records: list[dict[str, Any]] = []
 
-    for game_row in schedules.itertuples(index=False):
-        game = game_row._asdict()
+    # Reuse one Session and connection pool for the entire ingestion.
+    weather_client = OpenMeteoClient(
+        timeout=(5, 30),
+        max_retries=3,
+    )
 
-        game_id = game["game_id"]
-        matchup = (
-            f"{game['away_team']} at {game['home_team']}"
-        )
+    total_games = len(schedules)
 
-        try:
-            weather = get_weather_for_game(
-                game=game,
-                client=client,
-            )
-
-            weather_records.append(weather)
+    try:
+        for game_number, game in enumerate(
+            schedules.itertuples(index=False),
+            start=1,
+        ):
+            game_id = getattr(game, "game_id")
+            gameday = getattr(game, "gameday")
+            gametime = getattr(game, "gametime")
+            home_team = getattr(game, "home_team")
 
             logger.info(
-                "Weather retrieved: %s",
-                matchup,
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "Weather failed for game %s: %s",
+                "Weather ingestion: %s/%s game_id=%s",
+                game_number,
+                total_games,
                 game_id,
-                exc,
             )
 
-            # Preserve failed games for quality checks.
-            weather_records.append({
+            game_start_time = time.monotonic()
+
+            base_record = {
                 "game_id": game_id,
-                "season": game["season"],
-                "week": game["week"],
-                "home_team": game["home_team"],
-                "away_team": game["away_team"],
-                "weather_available": False,
-                "weather_error": str(exc),
-            })
+                "gameday": gameday,
+                "gametime": gametime,
+                "home_team": home_team,
+            }
+
+            try:
+                weather = get_weather_for_game(
+                    home_team=home_team,
+                    gameday=gameday,
+                    gametime=gametime,
+                    client=weather_client,
+                )
+
+                record = {
+                    **base_record,
+                    **weather,
+                }
+
+                weather_records.append(record)
+
+                elapsed = time.monotonic() - game_start_time
+
+                logger.info(
+                    "Weather completed: game_id=%s "
+                    "available=%s duration=%.2fs",
+                    game_id,
+                    record.get("weather_available"),
+                    elapsed,
+                )
+
+            except Exception as exc:
+                # Catch unexpected errors for this individual game.
+                # The rest of the season should continue processing.
+                elapsed = time.monotonic() - game_start_time
+
+                logger.exception(
+                    "Unexpected weather failure: game_id=%s "
+                    "duration=%.2fs",
+                    game_id,
+                    elapsed,
+                )
+
+                weather_records.append(
+                    {
+                        **base_record,
+                        "weather_available": False,
+                        "reason": "Unexpected ingestion error",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                )
+
+    finally:
+        weather_client.close()
 
     weather_df = pd.DataFrame(weather_records)
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
     output_path = output_dir / "game_weather.parquet"
 
@@ -100,29 +149,59 @@ def ingest_game_weather(
         index=False,
     )
 
-    successful = weather_df["weather_available"].eq(True).sum()
-    indoor_dome = (
-            weather_df["weather_available"].eq(False)
-            & weather_df["reason"].eq("Indoor dome")
-        ).sum()
-    failed = (
-            weather_df["weather_available"].eq(False)
-            & weather_df["reason"].ne("Indoor dome")
-        ).sum()
-
     logger.info(
-        "Saved %d weather records to %s",
-        len(weather_df),
+        "Weather data written: path=%s rows=%s",
         output_path,
+        len(weather_df),
+    )
+
+    # Summary statistics.
+    if weather_df.empty:
+        logger.warning("No weather records were generated")
+        return weather_df
+
+    successful = int(
+        weather_df["weather_available"]
+        .fillna(False)
+        .astype(bool)
+        .sum()
+    )
+    indoor_dome = ( 
+        weather_df["weather_available"].eq(False) & 
+        weather_df["reason"].eq("Indoor dome") 
+    ).sum()
+    retractable_roof = (
+        weather_df["weather_available"].eq(False) & 
+        weather_df["reason"].eq("Retractable roof; roof state unavailable") 
+    ).sum()
+    failed = ( 
+        weather_df["weather_available"].eq(False) & 
+        weather_df["reason"].ne("Indoor dome") &
+        weather_df["reason"].ne("Retractable roof; roof state unavailable") 
+    ).sum() 
+
+    reason_counts = (
+        weather_df.loc[
+            ~weather_df["weather_available"].fillna(False).astype(bool),
+            "reason",
+        ]
+        .fillna("Unknown")
+        .value_counts()
+        .to_dict()
     )
 
     logger.info(
-        "Weather summary: %d successful, %d indoor, %d failed",
+        "Weather summary: total=%s successful=%s dome/roof=%s failed=%s",
+        len(weather_df),
         successful,
-        indoor_dome,
+        indoor_dome + retractable_roof,
         failed,
     )
 
+    logger.info(
+        "Weather unavailable reasons: %s",
+        reason_counts,
+    )
     return weather_df
 
 def main():
