@@ -204,89 +204,188 @@ def ingest_game_weather(
     )
     return weather_df
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Ingest NFL foundation data"
+    )
+
+    parser.add_argument(
+        "--season",
+        type=int,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--weeks",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Specific weeks to ingest. Defaults to all available weeks.",
+    )
+
+    parser.add_argument(
+        "--refresh-weather",
+        action="store_true",
+        help="Retry weather for games that previously failed.",
+    )
+
+    parser.add_argument(
+        "--skip-participation",
+        action="store_true",
+        help="Skip unavailable official participation data.",
+    )
+
+    return parser.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--season", type=int, required=True)
-    args = parser.parse_args()
+    args = parse_args()
+
     configure_logging(settings.log_level)
+
     store = DuckDBStore(settings.db_path)
     nflverse = NflverseAdapter(settings)
+
     advanced = [
-        PublicAdvancedAdapter(settings, "rbsdm", "https://rbsdm.com/"),
-        PublicAdvancedAdapter(settings, "ftn", "https://ftnfantasy.com/nfl/stats"),
-        PublicAdvancedAdapter(settings, "sumersports_offense", "https://sumersports.com/teams/offensive/"),
-        PublicAdvancedAdapter(settings, "sumersports_defense", "https://sumersports.com/teams/defensive/"),
+        PublicAdvancedAdapter(
+            settings,
+            "rbsdm",
+            "https://rbsdm.com/",
+        ),
+        PublicAdvancedAdapter(
+            settings,
+            "ftn",
+            "https://ftnfantasy.com/nfl/stats",
+        ),
+        PublicAdvancedAdapter(
+            settings,
+            "sumersports_offense",
+            "https://sumersports.com/teams/offensive/",
+        ),
+        PublicAdvancedAdapter(
+            settings,
+            "sumersports_defense",
+            "https://sumersports.com/teams/defensive/",
+        ),
     ]
+
     results = []
 
-    # Ingest schedules first
-    result = nflverse.safe_ingest(
-        dataset="schedules",
-        season=args.season,
-        stat_type=None,
-    )
-
-    store.record_result(result)
-    results.append(result)
-
-    # Load schedules from the generated Parquet file
-    schedule_path = (
-        Path("data/raw/nflverse") / f"schedules_{args.season}.parquet"
-    )
-
-    if not schedule_path.exists():
-        raise FileNotFoundError(
-            f"Schedule file not found: {schedule_path}"
-        )
-
-    schedules = pd.read_parquet(schedule_path)
-
-    # Retrieve weather for every scheduled game
-    weather_result = ingest_game_weather(
-        schedules=schedules,
-        output_dir=Path("data/raw/weather"),
-    )
-    datasets = [
-        ("players", None),
-        ("ff_playerids", None),
-        ("player_stats", None),
-        ("pbp", None),
-        ("rosters", None),
-        ("rosters_weekly", None),
-        ("snap_counts", None),
-        ("participation", None),
-    ]
-    
-    for dataset, stat_type in datasets:
+    try:
+        # Ingest schedule
         result = nflverse.safe_ingest(
-            dataset=dataset, season=args.season, stat_type=stat_type
+            dataset="schedules",
+            season=args.season,
+            stat_type=None,
         )
+
         store.record_result(result)
         results.append(result)
 
-    for stat_type in ["passing", "receiving", "rushing"]:
-        result = nflverse.safe_ingest(
-            dataset="nextgen_stats", season=args.season, stat_type=stat_type
+        schedule_path = (
+            Path("data/raw/nflverse")
+            / f"schedules_{args.season}.parquet"
         )
-        store.record_result(result)
-        results.append(result)
 
-    for stat_type in ["pass", "rush", "rec", "def"]:
-        result = nflverse.safe_ingest(
-            dataset="pfr_advstats", season=args.season, stat_type=stat_type
+        if not schedule_path.exists():
+            raise FileNotFoundError(
+                f"Schedule file not found: {schedule_path}"
+            )
+
+        schedules = pd.read_parquet(schedule_path)
+
+        # Filter requested weeks
+        if args.weeks is not None:
+            if "week" not in schedules.columns:
+                raise ValueError(
+                    "Schedules missing required column: week"
+                )
+
+            schedules = schedules[
+                schedules["week"].isin(args.weeks)
+            ].copy()
+
+        logger.info(
+            "Processing season=%s weeks=%s games=%s",
+            args.season,
+            args.weeks if args.weeks else "all",
+            len(schedules),
         )
-        store.record_result(result)
-        results.append(result)
 
-    for adapter in advanced:
-        result = adapter.safe_ingest(dataset="team_or_player_advanced_metrics")
-        store.record_result(result)
-        results.append(result)
+        # Weather ingestion
+        # Note: this currently writes one Parquet file and does
+        # not yet merge with previously stored weather data.
+        ingest_game_weather(
+            schedules=schedules,
+            output_dir=Path("data/raw/weather"),
+        )
 
-    
-    store.close()
+        datasets = [
+            ("players", None),
+            ("ff_playerids", None),
+            ("player_stats", None),
+            ("pbp", None),
+            ("rosters", None),
+            ("rosters_weekly", None),
+            ("snap_counts", None),
+        ]
+
+        if not args.skip_participation:
+            datasets.append(("participation", None))
+
+        for dataset, stat_type in datasets:
+            result = nflverse.safe_ingest(
+                dataset=dataset,
+                season=args.season,
+                stat_type=stat_type,
+            )
+
+            store.record_result(result)
+            results.append(result)
+
+        # Next Gen Stats
+        for stat_type in ["passing", "receiving", "rushing"]:
+            result = nflverse.safe_ingest(
+                dataset="nextgen_stats",
+                season=args.season,
+                stat_type=stat_type,
+            )
+
+            store.record_result(result)
+            results.append(result)
+
+        # PFR Advanced Stats
+        for stat_type in ["pass", "rush", "rec", "def"]:
+            result = nflverse.safe_ingest(
+                dataset="pfr_advstats",
+                season=args.season,
+                stat_type=stat_type,
+            )
+
+            store.record_result(result)
+            results.append(result)
+
+        # Public advanced metrics
+        for adapter in advanced:
+            result = adapter.safe_ingest(
+                dataset="team_or_player_advanced_metrics"
+            )
+
+            store.record_result(result)
+            results.append(result)
+
+    finally:
+        store.close()
+
     for result in results:
-        print(f"{result.source:22} {result.dataset:28} {result.status:8} {result.message}")
+        print(
+            f"{result.source:22} "
+            f"{result.dataset:28} "
+            f"{result.status:8} "
+            f"{result.message}"
+        )
+
 
 if __name__ == "__main__":
     main()
