@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 import requests
 from player_lookup import NFLPlayerLookup
+from nflverse import NflverseAdapter
 
 
 # =============================================================================
@@ -54,6 +55,44 @@ REQUEST_TIMEOUT = 30
 logger = logging.getLogger(__name__)
 
 player_lookup = NFLPlayerLookup()
+nflverse = NflverseAdapter(
+    raw_dir=PROJECT_ROOT / "data" / "raw" / "nflverse"
+)
+
+NFL_TEAM_NAME_TO_ABBR = {
+    "Arizona Cardinals": "ARI",
+    "Atlanta Falcons": "ATL",
+    "Baltimore Ravens": "BAL",
+    "Buffalo Bills": "BUF",
+    "Carolina Panthers": "CAR",
+    "Chicago Bears": "CHI",
+    "Cincinnati Bengals": "CIN",
+    "Cleveland Browns": "CLE",
+    "Dallas Cowboys": "DAL",
+    "Denver Broncos": "DEN",
+    "Detroit Lions": "DET",
+    "Green Bay Packers": "GB",
+    "Houston Texans": "HOU",
+    "Indianapolis Colts": "IND",
+    "Jacksonville Jaguars": "JAX",
+    "Kansas City Chiefs": "KC",
+    "Las Vegas Raiders": "LV",
+    "Los Angeles Chargers": "LAC",
+    "Los Angeles Rams": "LA",
+    "Miami Dolphins": "MIA",
+    "Minnesota Vikings": "MIN",
+    "New England Patriots": "NE",
+    "New Orleans Saints": "NO",
+    "New York Giants": "NYG",
+    "New York Jets": "NYJ",
+    "Philadelphia Eagles": "PHI",
+    "Pittsburgh Steelers": "PIT",
+    "San Francisco 49ers": "SF",
+    "Seattle Seahawks": "SEA",
+    "Tampa Bay Buccaneers": "TB",
+    "Tennessee Titans": "TEN",
+    "Washington Commanders": "WAS",
+}
 
 
 # =============================================================================
@@ -108,6 +147,131 @@ def get_nfl_events(api_key: str) -> list[dict[str, Any]]:
     )
 
     return events
+
+def filter_events_to_week(
+    events: list[dict[str, Any]],
+    season: int,
+    week: int,
+) -> list[dict[str, Any]]:
+    """
+    Filter Odds API NFL events to games belonging to a
+    specific NFL season and regular-season week.
+
+    Uses the nflverse schedule as the source of truth
+    for season/week assignment.
+    """
+
+    schedule = nflverse.load_schedules(
+        season=season
+    )
+
+    # -------------------------------------------------------------
+    # Validate schedule columns
+    # -------------------------------------------------------------
+
+    required_columns = {
+        "week",
+        "home_team",
+        "away_team",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(schedule.columns)
+    )
+
+    if missing_columns:
+        raise ValueError(
+            "nflverse schedule is missing required "
+            f"columns: {missing_columns}"
+        )
+
+    # -------------------------------------------------------------
+    # Restrict schedule to requested week
+    # -------------------------------------------------------------
+
+    week_schedule = schedule[
+        schedule["week"].eq(week)
+    ].copy()
+
+    if week_schedule.empty:
+        logger.warning(
+            "No nflverse schedule games found for "
+            "season=%s week=%s",
+            season,
+            week,
+        )
+
+        return []
+
+    # -------------------------------------------------------------
+    # Create matchup lookup
+    # -------------------------------------------------------------
+
+    scheduled_matchups = {
+        (
+            row["home_team"],
+            row["away_team"],
+        )
+        for _, row in week_schedule.iterrows()
+    }
+
+    # -------------------------------------------------------------
+    # Filter Odds API events
+    # -------------------------------------------------------------
+
+    filtered_events = []
+
+    for event in events:
+
+        home_team = event.get(
+            "home_team"
+        )
+
+        away_team = event.get(
+            "away_team"
+        )
+
+        home_abbr = NFL_TEAM_NAME_TO_ABBR.get(
+            home_team
+        )
+
+        away_abbr = NFL_TEAM_NAME_TO_ABBR.get(
+            away_team
+        )
+
+        if home_abbr is None:
+            logger.warning(
+                "Unknown NFL team name from Odds API: %s",
+                home_team,
+            )
+            continue
+
+        if away_abbr is None:
+            logger.warning(
+                "Unknown NFL team name from Odds API: %s",
+                away_team,
+            )
+            continue
+
+        matchup = (
+            home_abbr,
+            away_abbr,
+        )
+
+        if matchup in scheduled_matchups:
+            filtered_events.append(event)
+
+    logger.info(
+        "Filtered NFL events to season=%s week=%s: "
+        "%d/%d events",
+        season,
+        week,
+        len(filtered_events),
+        len(events),
+    )
+
+    return filtered_events
 
 
 def get_event_props(
@@ -531,9 +695,15 @@ def append_to_parquet(
             ignore_index=True,
         )
 
+        logger.info("Existing parquet columns: %s", list(existing.columns) if not existing.empty else [])
+        logger.info("New dataframe columns: %s", list(df.columns))
+        logger.info("Combined columns: %s", list(combined.columns))
+        logger.info("Combined shape: %s", combined.shape)
+
     else:
 
         combined = df.copy()
+
 
     # ---------------------------------------------------------
     # Remove exact duplicate observations
@@ -571,7 +741,7 @@ def append_to_parquet(
             "commence_time",
             "event_id",
             "market",
-            "player",
+            "player_name",
             "bookmaker",
             "snapshot_time",
         ]
@@ -660,13 +830,26 @@ def ingest_event(
 
 def ingest_all_events(
     api_key: str,
+    season: int,
+    week: int,
 ) -> pd.DataFrame:
     """
-    Fetch all current NFL events and ingest their props.
+    Fetch current NFL events and ingest props only
+    for games belonging to the requested NFL week.
     """
 
     events = get_nfl_events(
         api_key
+    )
+
+    # ---------------------------------------------------------
+    # Filter events to requested NFL week
+    # ---------------------------------------------------------
+
+    events = filter_events_to_week(
+        events=events,
+        season=season,
+        week=week,
     )
 
     all_dataframes = []
@@ -740,7 +923,25 @@ def parse_args():
         action="store_true",
         help=(
             "Ingest props for all current "
-            "NFL events."
+            "NFL events in the requested week."
+        ),
+    )
+
+    parser.add_argument(
+        "--season",
+        type=int,
+        required=True,
+        help=(
+            "NFL season, e.g. 2026."
+        ),
+    )
+
+    parser.add_argument(
+        "--week",
+        type=int,
+        required=True,
+        help=(
+            "NFL regular-season week, e.g. 4."
         ),
     )
 
@@ -788,7 +989,9 @@ def main():
     elif args.all:
 
         df = ingest_all_events(
-            api_key=api_key
+            api_key=api_key,
+            season=args.season,
+            week=args.week,
         )
 
     else:
@@ -813,6 +1016,14 @@ def main():
 
     print(
         f"Output: {PROPS_PARQUET}"
+    )
+
+    print(
+    f"Season: {args.season}"
+    )
+
+    print(
+        f"Week: {args.week}"
     )
 
     if not df.empty:
