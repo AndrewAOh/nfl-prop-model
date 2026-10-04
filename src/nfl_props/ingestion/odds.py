@@ -15,6 +15,15 @@ from player_lookup import NFLPlayerLookup
 from nflverse import NflverseAdapter
 
 
+"""
+New API Odds Ingestion Process: API -> get_event_props() -> save_raw_event() -> process_event() -> Parquet
+- Uses ingest_events()
+
+Previously downloaded API Odds: JSON -> load_raw_event() -> process_event() -> Parquet
+- Uses ingest_raw_events()
+
+"""
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -31,7 +40,7 @@ PROP_MARKETS = [
     "player_receptions",
 ]
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 RAW_PROPS_DIR = (
     PROJECT_ROOT
@@ -39,6 +48,14 @@ RAW_PROPS_DIR = (
     / "raw"
     / "odds"
     / "props"
+)
+
+RAW_EVENTS_DIR = (
+    PROJECT_ROOT
+        / "data"
+        / "raw"
+        / "odds"
+        / "events"
 )
 
 PROCESSED_DIR = (
@@ -487,6 +504,77 @@ def save_raw_event(
 
 
 # =============================================================================
+# LOAD RAW EVENT (only used for offline - when api already donwloaded)
+# =============================================================================
+
+def load_raw_event(
+    raw_path: Path,
+) -> tuple[dict[str, Any], datetime]:
+    """
+    Load a previously saved raw Odds API response.
+
+    Reconstructs the original snapshot timestamp from
+    the file path and filename created by save_raw_event().
+    """
+
+    with raw_path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+        event = json.load(f)
+
+    # Filename format:
+    #
+    # {event_id}_{HHMMSS}_{microseconds}.json
+    #
+    # Example:
+    #
+    # abc123_143025_123456.json
+
+    timestamp_parts = raw_path.stem.rsplit(
+        "_",
+        2,
+    )
+
+    if len(timestamp_parts) != 3:
+        raise ValueError(
+            f"Unexpected raw odds filename format: "
+            f"{raw_path.name}"
+        )
+
+    _, time_part, microseconds = timestamp_parts
+
+    snapshot_date = raw_path.parent.name
+
+    snapshot_time = datetime.strptime(
+        f"{snapshot_date} {time_part}_{microseconds}",
+        "%Y-%m-%d %H%M%S_%f",
+    ).replace(
+        tzinfo=timezone.utc
+    )
+
+    return event, snapshot_time
+
+
+# =============================================================================
+# PROCESS EVENT (after save_raw_event() in live api | after load_raw_event() in offline ingestion)
+# =============================================================================
+
+def process_event(
+    event: dict[str, Any],
+    snapshot_time: datetime,
+) -> pd.DataFrame:
+
+    df = normalize_event_props(
+        event=event,
+        snapshot_time=snapshot_time,
+    )
+
+    append_to_parquet(df)
+
+    return df
+
+# =============================================================================
 # NORMALIZATION
 # =============================================================================
 
@@ -787,7 +875,7 @@ def ingest_event(
     )
 
     # ---------------------------------------------------------
-    # Fetch
+    # Fetch events
     # ---------------------------------------------------------
 
     event = get_event_props(
@@ -804,24 +892,30 @@ def ingest_event(
         snapshot_time=snapshot_time,
     )
 
+    # New pipeline 
+    return process_event(
+        event=event,
+        snapshot_time=snapshot_time,
+    )
+    # Old previous code for pipeline
     # ---------------------------------------------------------
     # Normalize
     # ---------------------------------------------------------
 
-    df = normalize_event_props(
-        event=event,
-        snapshot_time=snapshot_time,
-    )
+    # df = normalize_event_props(
+    #     event=event,
+    #     snapshot_time=snapshot_time,
+    # )
 
     # ---------------------------------------------------------
     # Save processed data
     # ---------------------------------------------------------
 
-    append_to_parquet(
-        df
-    )
+    # append_to_parquet(
+    #     df
+    # )
 
-    return df
+    # return df
 
 
 # =============================================================================
@@ -838,23 +932,46 @@ def ingest_all_events(
     for games belonging to the requested NFL week.
     """
 
+    # Ingests events by searching through Odds API to get event ids of NFL games
     events = get_nfl_events(
         api_key
     )
+    # Store these events in data/raw/odds/events/
+    # Store the complete events response as a raw snapshot
+    snapshot_time = datetime.now(timezone.utc)
+
+    RAW_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    events_path = (
+        RAW_EVENTS_DIR
+        / snapshot_time.strftime("%Y-%m-%d")
+        / f"events_{snapshot_time.strftime('%H%M%S_%f')}.json"
+    )
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with events_path.open("w", encoding="utf-8") as f:
+        json.dump(events, f, indent=2)
+
+    print(f"Saved {len(events)} NFL events to {events_path}")
 
     # ---------------------------------------------------------
     # Filter events to requested NFL week
     # ---------------------------------------------------------
 
-    events = filter_events_to_week(
-        events=events,
-        season=season,
-        week=week,
+    # Filter events to the requested NFL week
+    week_events = filter_events_to_week(
+        events,
+        season,
+        week,
+    )
+    print(
+        f"Found {len(week_events)} NFL events "
+        f"for {season} Week {week}"
     )
 
     all_dataframes = []
 
-    for event in events:
+    for event in week_events:
 
         event_id = event["id"]
 
@@ -893,6 +1010,31 @@ def ingest_all_events(
 
     return pd.DataFrame()
 
+# =============================================================================
+# EVENT INGESTION FOR PREVIOUSLY SAVED DATA
+# =============================================================================
+def ingest_raw_file(
+    raw_path: Path,
+) -> pd.DataFrame:
+    """
+    Process a previously saved raw Odds API JSON file.
+
+    No API requests are made.
+    """
+
+    logger.info(
+        "Processing cached raw odds: %s",
+        raw_path,
+    )
+
+    event, snapshot_time = load_raw_event(
+        raw_path
+    )
+
+    return process_event(
+        event=event,
+        snapshot_time=snapshot_time,
+    )
 
 # =============================================================================
 # CLI
@@ -930,7 +1072,7 @@ def parse_args():
     parser.add_argument(
         "--season",
         type=int,
-        required=True,
+        # required=True,
         help=(
             "NFL season, e.g. 2026."
         ),
@@ -939,9 +1081,18 @@ def parse_args():
     parser.add_argument(
         "--week",
         type=int,
-        required=True,
+        # required=True,
         help=(
             "NFL regular-season week, e.g. 4."
+        ),
+    )
+
+    parser.add_argument(
+        "--raw-file",
+        type=Path,
+        help=(
+            "Process an existing raw Odds API JSON file "
+            "without making an API request."
         ),
     )
 
@@ -979,7 +1130,13 @@ def main():
     # Ingest
     # ---------------------------------------------------------
 
-    if args.event_id:
+    if args.raw_file:
+
+        df = ingest_raw_file(
+            raw_path=args.raw_file
+        )
+
+    elif args.event_id:
 
         df = ingest_event(
             api_key=api_key,
@@ -987,6 +1144,11 @@ def main():
         )
 
     elif args.all:
+
+        if args.season is None or args.week is None:
+            raise SystemExit(
+                "--season and --week are required when using --all"
+            )
 
         df = ingest_all_events(
             api_key=api_key,
@@ -997,9 +1159,7 @@ def main():
     else:
 
         raise SystemExit(
-            "Specify either "
-            "--event-id EVENT_ID "
-            "or --all"
+            "Specify --event-id, --all, or --raw-file"
         )
 
     # ---------------------------------------------------------
