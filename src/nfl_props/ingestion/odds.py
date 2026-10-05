@@ -6,13 +6,14 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import requests
-from player_lookup import NFLPlayerLookup
-from nflverse import NflverseAdapter
+from .player_lookup import NFLPlayerLookup
+from .nflverse import NflverseAdapter
 
 
 """
@@ -40,7 +41,7 @@ PROP_MARKETS = [
     "player_receptions",
 ]
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 RAW_PROPS_DIR = (
     PROJECT_ROOT
@@ -448,8 +449,11 @@ def american_odds_to_probability(
 # =============================================================================
 
 def save_raw_event(
-    event: dict[str, Any],
-    snapshot_time: datetime,
+    event_data,
+    snapshot_time,
+    event_id=None,
+    season=None,
+    week=None,
 ) -> Path:
     """
     Save the complete raw Odds API response as JSON.
@@ -458,47 +462,26 @@ def save_raw_event(
     without making another API request.
     """
 
-    snapshot_date = snapshot_time.strftime(
-        "%Y-%m-%d"
+    RAW_PROPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    home_team = event_data.get("home_team", "HOME")
+    away_team = event_data.get("away_team", "AWAY")
+
+    date_str = snapshot_time.strftime("%Y%m%d")
+    time_str = snapshot_time.strftime("%H%M%S")
+
+    filename = (
+        f"{season}_WK{week:02d}_"
+        f"{away_team}_{home_team}_"
+        f"{date_str}_{time_str}_{event_id}.json"
     )
 
-    # Include microseconds so two snapshots taken during
-    # the same second cannot overwrite one another.
-    snapshot_stamp = snapshot_time.strftime(
-        "%H%M%S_%f"
-    )
+    output_path = RAW_PROPS_DIR / snapshot_time.strftime("%Y-%m-%d") / filename
 
-    output_dir = (
-        RAW_PROPS_DIR
-        / snapshot_date
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    event_id = event["id"]
-
-    output_path = (
-        output_dir
-        / f"{event_id}_{snapshot_stamp}.json"
-    )
-
-    with output_path.open(
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            event,
-            f,
-            indent=2,
-        )
-
-    logger.info(
-        "Saved raw odds: %s",
-        output_path,
-    )
+    with open(output_path, "w") as f:
+        json.dump(event_data, f, indent=2)
 
     return output_path
 
@@ -603,6 +586,21 @@ def normalize_event_props(
         snapshot_time.isoformat()
     )
 
+    home_team = event.get(
+        "home_team"
+    )
+
+    away_team = event.get(
+        "away_team"
+    )
+    home_abbr = NFL_TEAM_NAME_TO_ABBR.get(
+        home_team
+    )
+
+    away_abbr = NFL_TEAM_NAME_TO_ABBR.get(
+        away_team
+    )
+
     for bookmaker in event.get(
         "bookmakers",
         [],
@@ -650,6 +648,7 @@ def normalize_event_props(
                     "price"
                 )
 
+
                 # -------------------------------------------------------------
                 # Stable prop ID
                 # -------------------------------------------------------------
@@ -675,12 +674,11 @@ def normalize_event_props(
                 # Player ID
                 # -------------------------------------------------------------
                 
-                player_id = player_lookup.lookup(player_name)
+                player_id = player_lookup.lookup(player_name, home_abbr, away_abbr)
 
                 # -------------------------------------------------------------
                 # Store normalized row
                 # -------------------------------------------------------------
-
                 rows.append(
                     {
                         "prop_id": prop_id,
@@ -695,6 +693,22 @@ def normalize_event_props(
 
                         "commence_time": event.get(
                             "commence_time"
+                        ),
+                        
+                        "game_day": (
+                            datetime.fromisoformat(
+                                event.get("commence_time").replace("Z", "+00:00")
+                            )
+                            .astimezone(ZoneInfo("America/Los_Angeles"))
+                            .strftime("%Y-%m-%d")
+                        ),
+
+                        "game_time": (
+                            datetime.fromisoformat(
+                                event.get("commence_time").replace("Z", "+00:00")
+                            )
+                            .astimezone(ZoneInfo("America/Los_Angeles"))
+                            .strftime("%I:%M %p")
                         ),
 
                         "home_team": event.get(
@@ -783,10 +797,10 @@ def append_to_parquet(
             ignore_index=True,
         )
 
-        logger.info("Existing parquet columns: %s", list(existing.columns) if not existing.empty else [])
-        logger.info("New dataframe columns: %s", list(df.columns))
-        logger.info("Combined columns: %s", list(combined.columns))
-        logger.info("Combined shape: %s", combined.shape)
+        # logger.info("Existing parquet columns: %s", list(existing.columns) if not existing.empty else [])
+        # logger.info("New dataframe columns: %s", list(df.columns))
+        # logger.info("Combined columns: %s", list(combined.columns))
+        # logger.info("Combined shape: %s", combined.shape)
 
     else:
 
@@ -815,9 +829,16 @@ def append_to_parquet(
         "snapshot_time",
     ]
 
+    rows_before_dedup = len(combined)
+
     combined = combined.drop_duplicates(
         subset=dedup_columns,
         keep="last",
+    )
+
+    rows_after_dedup = len(combined)
+    duplicates_removed = (
+        rows_before_dedup - rows_after_dedup
     )
 
     # ---------------------------------------------------------
@@ -847,9 +868,12 @@ def append_to_parquet(
     )
 
     logger.info(
-        "Saved %d total prop observations to %s",
-        len(combined),
-        output_path,
+        "Parquet update: %d rows before dedup | "
+        "%d duplicates removed | "
+        "%d rows saved",
+        rows_before_dedup,
+        duplicates_removed,
+        rows_after_dedup,
     )
 
 
@@ -860,6 +884,8 @@ def append_to_parquet(
 def ingest_event(
     api_key: str,
     event_id: str,
+    season=None,
+    week=None
 ) -> pd.DataFrame:
     """
     Fetch, save, normalize, and store one NFL event's props.
@@ -890,6 +916,9 @@ def ingest_event(
     save_raw_event(
         event=event,
         snapshot_time=snapshot_time,
+        event_id=event_id,
+        season=season,
+        week=week
     )
 
     # New pipeline 
@@ -944,6 +973,7 @@ def ingest_all_events(
 
     events_path = (
         RAW_EVENTS_DIR
+        / f"{season}_WK{week:02d}_"
         / snapshot_time.strftime("%Y-%m-%d")
         / f"events_{snapshot_time.strftime('%H%M%S_%f')}.json"
     )
@@ -980,6 +1010,8 @@ def ingest_all_events(
             df = ingest_event(
                 api_key=api_key,
                 event_id=event_id,
+                season=season,
+                week=week
             )
 
             if not df.empty:
@@ -1022,19 +1054,45 @@ def ingest_raw_file(
     No API requests are made.
     """
 
-    logger.info(
-        "Processing cached raw odds: %s",
-        raw_path,
-    )
-
     event, snapshot_time = load_raw_event(
         raw_path
     )
 
-    return process_event(
+    home_team = event.get("home_team", "Unknown")
+    away_team = event.get("away_team", "Unknown")
+    event_id = event.get("id", "Unknown")
+    commence_time = event.get("commence_time", "Unknown")
+    game_datetime = (
+        datetime.fromisoformat(
+            commence_time.replace("Z", "+00:00")
+        )
+        .astimezone(ZoneInfo("America/Los_Angeles"))
+    )
+    game_day = game_datetime.strftime("%Y-%m-%d")
+    game_time = game_datetime.strftime("%I:%M %p")
+
+    logger.info(
+        "Processing %s | %s | %s | %s @ %s | event=%s | snapshot=%s",
+        raw_path.name,
+        game_day,
+        game_time,
+        away_team,
+        home_team,
+        event_id,
+        snapshot_time.strftime("%H:%M:%S"),
+    )
+
+    df = process_event(
         event=event,
         snapshot_time=snapshot_time,
     )
+
+    logger.info(
+        "Processed: %d prop rows",
+        len(df),
+    )
+
+    return df
 
 # =============================================================================
 # CLI
@@ -1096,6 +1154,12 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--raw-dir",
+        type=str,
+        help="Process all raw prop JSON files in a directory without making API calls.",
+    )
+
     return parser.parse_args()
 
 
@@ -1114,8 +1178,8 @@ def main():
         level=logging.INFO,
         format=(
             "%(asctime)s | "
-            "%(levelname)s | "
-            "%(name)s | "
+            # "%(levelname)s | "
+            # "%(name)s | "
             "%(message)s"
         ),
     )
@@ -1155,6 +1219,40 @@ def main():
             season=args.season,
             week=args.week,
         )
+    elif args.raw_dir:
+        raw_dir = Path(args.raw_dir)
+
+        if not raw_dir.exists():
+            raise FileNotFoundError(
+                f"Raw directory does not exist: {raw_dir}"
+            )
+
+        raw_files = sorted(raw_dir.glob("*.json"))
+
+        if not raw_files:
+            print(f"No JSON files found in {raw_dir}")
+            return
+
+        print(f"Found {len(raw_files)} raw prop files.")
+
+        frames = []
+
+        for raw_file in raw_files:
+            print(f"Processing {raw_file}")
+
+            df = ingest_raw_file(raw_file)
+
+            if not df.empty:
+                frames.append(df)
+
+        if frames:
+            combined = pd.concat(frames, ignore_index=True)
+            print(
+                f"Processed {len(combined):,} prop rows "
+                f"from {len(raw_files)} files."
+            )
+        else:
+            print("No prop rows were produced.")
 
     else:
 
@@ -1166,25 +1264,19 @@ def main():
     # Summary
     # ---------------------------------------------------------
 
+    print()
     print("=" * 80)
     print("ODDS INGESTION COMPLETE")
     print("=" * 80)
 
-    print(
-        f"Rows ingested: {len(df):,}"
-    )
+    print(f"Rows processed: {len(df):,}")
+    print(f"Output:         {PROPS_PARQUET}")
 
-    print(
-        f"Output: {PROPS_PARQUET}"
-    )
+    if args.season is not None:
+        print(f"Season:         {args.season}")
 
-    print(
-    f"Season: {args.season}"
-    )
-
-    print(
-        f"Week: {args.week}"
-    )
+    if args.week is not None:
+        print(f"Week:           {args.week}")
 
     if not df.empty:
 
@@ -1219,6 +1311,10 @@ def main():
                 index=False
             )
         )
+    
+    player_lookup.log_mult_matched_names()
+    player_lookup.log_unresolved_names()
+    
 
 
 # =============================================================================

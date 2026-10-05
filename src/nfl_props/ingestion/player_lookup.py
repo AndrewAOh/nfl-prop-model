@@ -146,6 +146,10 @@ class NFLPlayerLookup:
 
         self._load_players(refresh=refresh)
 
+        self.unresolved_names = set()
+
+        self.mult_matched_names = set()
+
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
@@ -287,6 +291,8 @@ class NFLPlayerLookup:
     def lookup(
         self,
         player_name: Optional[str],
+        home_abbr=None,
+        away_abbr=None,
     ) -> Optional[str]:
         """
         Resolve a player name to gsis_id.
@@ -331,13 +337,37 @@ class NFLPlayerLookup:
             return gsis_id
 
         # --------------------------------------------------------------
+        # Multiple possible matches
+        # --------------------------------------------------------------
+        matches = self.players[
+            (self.players["normalized_name"] == normalized_name)
+            & (self.players["status"] == "ACT")
+            & (self.players['position'].isin(['QB', 'RB', 'FB', 'WR', 'TE']))
+        ]
+
+        event_teams = {
+            home_abbr,
+            away_abbr,
+        }
+
+        team_matches = matches[
+            matches["latest_team"].isin(event_teams)
+        ]
+
+        if len(team_matches) == 1:
+            # logger.log(f"Player ({normalized_name} matched with Team {team_matches.iloc[0]['team_abbr']})")
+            self.mult_matched_names.add(
+                (normalized_name, team_matches.iloc[0]["latest_team"])
+            )
+            return team_matches.iloc[0]["gsis_id"]
+
+        # --------------------------------------------------------------
         # Unresolved
         # --------------------------------------------------------------
 
-        logger.warning(
-            "Could not resolve NFL player name: %s",
-            player_name,
-        )
+        if normalized_name not in self.unresolved_names:
+            self.unresolved_names.add(normalized_name)
+            return None
 
         return None
 
@@ -366,3 +396,47 @@ class NFLPlayerLookup:
             return None
 
         return matches.iloc[0].to_dict()
+
+
+    def log_unresolved_names(self):
+        if not self.unresolved_names:
+            logger.info("All NFL player names were resolved successfully.")
+            return
+
+        logger.warning(
+            "Could not resolve %d unique NFL player names:",
+            len(self.unresolved_names),
+        )
+
+        for name in sorted(self.unresolved_names):
+            logger.warning("  - %s", name)
+
+        logger.info("Possible NFL Player mismatches")
+        for name in sorted(self.unresolved_names):
+            normalized = normalize_player_name(name)
+            matches = self.players[
+                self.players['normalized_name'] == normalized
+            ]
+
+            print(f'\n{name}')
+            print(f'Normalized: {normalized}')
+            print(f'Matches: {len(matches)}')
+
+            if len(matches):
+                print(
+                    matches[
+                        ['display_name', 'gsis_id']
+                    ].to_string(index=False)
+                )
+
+    def log_mult_matched_names(self):
+        if not self.mult_matched_names:
+            return
+
+        logger.info("Players resolved using team disambiguation:")
+        for name, team in sorted(self.mult_matched_names):
+            logger.info(
+                "Player (%s) matched with Team %s",
+                name,
+                team,
+            )
