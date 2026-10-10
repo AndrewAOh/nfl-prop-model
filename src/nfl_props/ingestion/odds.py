@@ -49,6 +49,7 @@ RAW_PROPS_DIR = (
     / "raw"
     / "odds"
     / "props"
+    / "theoddsapi"
 )
 
 RAW_EVENTS_DIR = (
@@ -57,16 +58,18 @@ RAW_EVENTS_DIR = (
         / "raw"
         / "odds"
         / "events"
+        / "theoddsapi"
 )
 
-PROCESSED_DIR = (
+# Store in Interim first. Processed will have odds in a clean format
+INTERIM_DIR = (
     PROJECT_ROOT
     / "data"
-    / "processed"
+    / "interim"
     / "odds"
 )
 
-PROPS_PARQUET = PROCESSED_DIR / "props.parquet"
+PROPS_PARQUET = INTERIM_DIR / "props.parquet"
 
 REQUEST_TIMEOUT = 30
 
@@ -571,6 +574,7 @@ def normalize_event_props(
     One row represents one:
 
         event
+        source
         bookmaker
         market
         player
@@ -682,6 +686,8 @@ def normalize_event_props(
                 rows.append(
                     {
                         "prop_id": prop_id,
+
+                        "source": "odds_api",
 
                         "event_id": event.get(
                             "id"
@@ -914,7 +920,7 @@ def ingest_event(
     # ---------------------------------------------------------
 
     save_raw_event(
-        event=event,
+        event_data=event,
         snapshot_time=snapshot_time,
         event_id=event_id,
         season=season,

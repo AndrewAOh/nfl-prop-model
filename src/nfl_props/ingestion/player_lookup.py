@@ -364,7 +364,6 @@ class NFLPlayerLookup:
         # --------------------------------------------------------------
         # Unresolved
         # --------------------------------------------------------------
-
         if normalized_name not in self.unresolved_names:
             self.unresolved_names.add(normalized_name)
             return None
@@ -399,6 +398,8 @@ class NFLPlayerLookup:
 
 
     def log_unresolved_names(self):
+        for name in sorted(self.unresolved_names):
+            logger.warning("  - %s", name)
         if not self.unresolved_names:
             logger.info("All NFL player names were resolved successfully.")
             return
