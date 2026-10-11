@@ -406,6 +406,25 @@ def fetch_events(
                 response.status_code,
             )
 
+            # Log API usage headers if SportsGameOdds provides them.
+            credit_headers = {
+                key.lower(): value
+                for key, value in response.headers.items()
+                if any(term in key.lower() for term in ("credit", "request", "quota", "rate"))
+            }
+
+            if credit_headers:
+                logger.info(
+                    "SportsGameOdds API usage headers | page=%d | %s",
+                    page_num,
+                    credit_headers,
+                )
+            else:
+                logger.debug(
+                    "No recognizable credit-usage headers returned for page %d",
+                    page_num,
+                )
+
             if not response.ok:
                 logger.error(
                     "SportsGameOdds API error: %s",
