@@ -2,7 +2,7 @@
 import argparse
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -336,14 +336,34 @@ def ingest_live_week(
         / f"{season}_WK{week:02d}"
         / run_time.strftime("%Y-%m-%d")
     )
+    
+    # Define a rolling 7-day window starting at ingestion time.
+    run_time = datetime.now(timezone.utc)
+    snapshot_text = run_time.isoformat()
+
+    starts_after = run_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    starts_before = (
+        run_time + timedelta(days=7)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    logger.info(
+        "SportsGameOdds API date filter | "
+        "startsAfter=%s | startsBefore=%s",
+        starts_after,
+        starts_before,
+    )
+
+    api_key = get_api_key()
 
     events, api_snapshot = fetch_events(
         raw_dir=events_dir,
-        api_key=get_api_key(),
+        api_key=api_key,
         limit=limit,
+        starts_after=starts_after,
+        starts_before=starts_before,
     )
 
-    log_account_usage(get_api_key())
+    log_account_usage(api_key)
 
     # Use the timestamp returned by the fetch function if it supplies one.
     if isinstance(api_snapshot, datetime):

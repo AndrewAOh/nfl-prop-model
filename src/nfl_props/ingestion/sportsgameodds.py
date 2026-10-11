@@ -461,7 +461,9 @@ def append_to_parquet(
 def fetch_events(
     raw_dir: Path,
     api_key: str,
-    limit: int = 100,
+    limit: int = 32,
+    starts_after: str | None = None,
+    starts_before: str | None = None,
 ) -> tuple[list[dict], str]:
     """Fetch paginated NFL events and preserve raw JSON responses."""
 
@@ -474,6 +476,13 @@ def fetch_events(
         "oddsAvailable": "true",
         "limit": limit,
     }
+
+    # Filter events at the API level to reduce unnecessary results.
+    if starts_after:
+        params["startsAfter"] = starts_after
+
+    if starts_before:
+        params["startsBefore"] = starts_before
 
     events = []
     page_num = 1
