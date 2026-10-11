@@ -17,6 +17,7 @@ from nfl_props.ingestion.sportsgameodds import (
     save_raw_event,
     player_lookup_log_mult_matched_names,
     player_lookup_log_unresolved_names,
+    log_account_usage,
 )
 from nfl_props.ingestion.player_lookup import NFLPlayerLookup
 
@@ -341,6 +342,8 @@ def ingest_live_week(
         api_key=get_api_key(),
         limit=limit,
     )
+
+    log_account_usage(get_api_key())
 
     # Use the timestamp returned by the fetch function if it supplies one.
     if isinstance(api_snapshot, datetime):

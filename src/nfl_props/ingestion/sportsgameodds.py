@@ -129,6 +129,96 @@ def get_api_key() -> str:
         )
     return api_key
 
+def log_account_usage(api_key: str) -> None:
+    """Log SportsGameOdds request and entity usage by rate-limit interval."""
+    url = f"{BASE_URL}/account/usage"
+
+    try:
+        response = requests.get(
+            url,
+            headers={"x-api-key": api_key},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+
+        if not payload.get("success"):
+            logger.warning(
+                "SportsGameOdds account usage request was unsuccessful: %s",
+                payload.get("error", "Unknown error"),
+            )
+            return
+
+        account = payload.get("data", {})
+        rate_limits = account.get("rateLimits", {})
+
+        logger.info(
+            "SportsGameOdds account | tier=%s | active=%s",
+            account.get("tier", "unknown"),
+            account.get("isActive", "unknown"),
+        )
+
+        for interval, limits in rate_limits.items():
+            # Request usage
+            current_requests = limits.get("current-requests")
+            max_requests = limits.get("max-requests")
+
+            if current_requests is not None:
+                if isinstance(max_requests, int):
+                    remaining = max(0, max_requests - current_requests)
+
+                    logger.info(
+                        "SportsGameOdds usage | interval=%s | "
+                        "requests=%s/%s | remaining=%s",
+                        interval,
+                        current_requests,
+                        max_requests,
+                        remaining,
+                    )
+                else:
+                    logger.info(
+                        "SportsGameOdds usage | interval=%s | "
+                        "requests=%s | limit=%s",
+                        interval,
+                        current_requests,
+                        max_requests or "not reported",
+                    )
+
+            # Entity usage
+            current_entities = limits.get("current-entities")
+            max_entities = limits.get("max-entities")
+
+            if current_entities is not None:
+                if isinstance(max_entities, int):
+                    remaining = max(0, max_entities - current_entities)
+
+                    logger.info(
+                        "SportsGameOdds usage | interval=%s | "
+                        "entities=%s/%s | remaining=%s",
+                        interval,
+                        current_entities,
+                        max_entities,
+                        remaining,
+                    )
+                else:
+                    logger.info(
+                        "SportsGameOdds usage | interval=%s | "
+                        "entities=%s | limit=%s",
+                        interval,
+                        current_entities,
+                        max_entities or "not reported",
+                    )
+
+    except requests.RequestException:
+        logger.exception(
+            "Failed to retrieve SportsGameOdds account usage"
+        )
+    except (ValueError, TypeError, AttributeError):
+        logger.exception(
+            "Failed to parse SportsGameOdds account usage response"
+        )
+
 
 def get_team_abbr(team: dict) -> str | None:
     """Map a SportsGameOdds team object to an nflverse abbreviation."""
