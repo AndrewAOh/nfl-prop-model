@@ -33,12 +33,40 @@ class NflverseAdapter(SourceAdapter):
             return frame
         return pd.DataFrame(frame)
 
-    def _load_cached(self, filename: str, loader) -> tuple[pd.DataFrame, Path]:
-        output_dir = self.settings.raw_root / "nflverse"
+    # Store each nflverse dataset in its matching source folder. The two
+    # reference tables (players and ff_playerids) remain at the nflverse root
+    # because there are no dedicated folders for them in the requested layout.
+    DATASET_DIRS = {
+        "schedules": "schedules_parquet_data",
+        "player_stats": "player_stats_parquet_data",
+        "pbp": "pbp_parquet_data",
+        "rosters": "rosters_parquet_data",
+        "rosters_weekly": "weekly_rosters_parquet_data",
+        "snap_counts": "snap_counts_parquet_data",
+        "participation": "participation_parquet_data",
+        "nextgen_stats_passing": "ngs_passing_parquet_data",
+        "nextgen_stats_receiving": "ngs_receiving_parquet_data",
+        "nextgen_stats_rushing": "ngs_rushing_parquet_data",
+        "pfr_advstats_pass": "pfr_advstats_pass_parquet_data",
+        "pfr_advstats_rec": "pfr_advstats_rec_parquet_data",
+        "pfr_advstats_rush": "pfr_advstats_rush_parquet_data",
+        "pfr_advstats_def": "pfr_advstats_def_parquet_data",
+    }
+
+    def _load_cached(
+        self,
+        filename: str,
+        loader,
+        dataset_key: str | None = None,
+    ) -> tuple[pd.DataFrame, Path]:
+        """Fetch fresh data and overwrite its current raw Parquet file."""
+        output_root = self.settings.raw_root / "nflverse"
+        dataset_dir = self.DATASET_DIRS.get(dataset_key) if dataset_key else None
+        output_dir = output_root / dataset_dir if dataset_dir else output_root
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / filename
-        if output_path.exists():
-            return pd.read_parquet(output_path), output_path
+
+        # Do not return a stale local cache: each ingestion run refreshes the file.
         frame = self._to_pandas(loader())
         frame.to_parquet(output_path, index=False)
         return frame, output_path
@@ -62,6 +90,7 @@ class NflverseAdapter(SourceAdapter):
             frame, path = self._load_cached(
                 f"schedules_{season}.parquet",
                 lambda: nfl.load_schedules(seasons=season),
+                dataset_key="schedules",
             )
         elif dataset == "players":
             frame, path = self._load_cached("players.parquet", nfl.load_players)
@@ -71,31 +100,37 @@ class NflverseAdapter(SourceAdapter):
             frame, path = self._load_cached(
                 f"player_stats_{season}.parquet",
                 lambda: nfl.load_player_stats(seasons=season, summary_level="week"),
+                dataset_key="player_stats",
             )
         elif dataset == "pbp":
             frame, path = self._load_cached(
                 f"pbp_{season}.parquet",
                 lambda: nfl.load_pbp(seasons=season),
+                dataset_key="pbp",
             )
         elif dataset == "rosters":
             frame, path = self._load_cached(
                 f"rosters_{season}.parquet",
                 lambda: nfl.load_rosters(seasons=season),
+                dataset_key="rosters",
             )
         elif dataset == "rosters_weekly":
             frame, path = self._load_cached(
                 f"rosters_weekly_{season}.parquet",
                 lambda: nfl.load_rosters_weekly(seasons=season),
+                dataset_key="rosters_weekly",
             )
         elif dataset == "snap_counts":
             frame, path = self._load_cached(
                 f"snap_counts_{season}.parquet",
                 lambda: nfl.load_snap_counts(seasons=season),
+                dataset_key="snap_counts",
             )
         elif dataset == "participation":
             frame, path = self._load_cached(
                 f"participation_{season}.parquet",
                 lambda: nfl.load_participation(seasons=season),
+                dataset_key="participation",
             )
         elif dataset == "nextgen_stats":
             if stat_type not in {"passing", "receiving", "rushing"}:
@@ -103,6 +138,7 @@ class NflverseAdapter(SourceAdapter):
             frame, path = self._load_cached(
                 f"nextgen_stats_{stat_type}_{season}.parquet",
                 lambda: nfl.load_nextgen_stats(seasons=season, stat_type=stat_type),
+                dataset_key=f"nextgen_stats_{stat_type}",
             )
         elif dataset == "pfr_advstats":
             if stat_type not in {"pass", "rush", "rec", "def"}:
@@ -112,6 +148,7 @@ class NflverseAdapter(SourceAdapter):
                 lambda: nfl.load_pfr_advstats(
                     seasons=season, stat_type=stat_type, summary_level="week"
                 ),
+                dataset_key=f"pfr_advstats_{stat_type}",
             )
         else:
             return IngestionResult(self.source_name, dataset, "skipped", message="Unknown dataset")
