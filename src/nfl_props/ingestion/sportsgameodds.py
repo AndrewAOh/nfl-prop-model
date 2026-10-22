@@ -22,7 +22,7 @@ PLAYER_PROP_STATS = {
     "passing_completions",
     "passing_touchdowns",
     "passing_interceptions",
-    "passing_longestCompletion"
+    "passing_longestCompletion",
     "rushing_yards",
     "rushing_attempts",
     "rushing_longestRush",
