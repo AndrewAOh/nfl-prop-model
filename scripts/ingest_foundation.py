@@ -284,7 +284,9 @@ def main():
         results.append(result)
 
         schedule_path = (
-            Path("data/raw/nflverse")
+            settings.raw_root
+            / "nflverse"
+            / "schedules_parquet_data"
             / f"schedules_{args.season}.parquet"
         )
 
